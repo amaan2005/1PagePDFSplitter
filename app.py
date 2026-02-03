@@ -181,23 +181,50 @@ def build_output_pdf_from_slices(
         p.insert_image(fitz.Rect(0, 0, out_w_pt, out_h_pt), stream=img_bytes)
     return out.tobytes()
 
+@st.cache_data(show_spinner=False)
+def export_vector_split(pdf_bytes: bytes, ranges: list[tuple[float, float]]) -> bytes:
+    """Vector-accurate split: no rasterization, stable on Streamlit Cloud."""
+    with fitz.open(stream=pdf_bytes, filetype="pdf") as src:
+        if src.page_count != 1:
+            raise ValueError(f"Expected 1-page PDF, got {src.page_count} pages")
+        page = src.load_page(0)
+        rect = page.rect  # PyMuPDF coords: origin top-left, y increases down
+
+        out = fitz.open()
+        for (a, b) in ranges:
+            # Convert top-origin fractions into PyMuPDF coordinates
+            y0 = rect.y0 + a * rect.height
+            y1 = rect.y0 + b * rect.height
+            clip = fitz.Rect(rect.x0, y0, rect.x1, y1)
+
+            # New page sized exactly to this slice
+            w = clip.width
+            h = clip.height
+            if h < 1:  # skip ultra-tiny slices
+                continue
+
+            newp = out.new_page(width=w, height=h)
+            newp.show_pdf_page(fitz.Rect(0, 0, w, h), src, 0, clip=clip)
+
+        return out.tobytes()
+
 uploaded = st.file_uploader("Drop a 1-page PDF here", type=["pdf"])
 if not uploaded:
     st.stop()
 
 pdf_bytes = uploaded.read()
-doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-page = doc.load_page(0)
-page_w_pt = page.rect.width
-page_h_pt = page.rect.height
-
-if doc.page_count != 1:
-    st.error(f"This tool ONLY supports PDFs with exactly 1 page. Yours has {doc.page_count} pages.")
-    st.stop()
+with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
+    if doc.page_count != 1:
+        st.error(f"This tool ONLY supports PDFs with exactly 1 page. Yours has {doc.page_count} pages.")
+        st.stop()
+    page = doc.load_page(0)
+    page_w_pt = page.rect.width
+    page_h_pt = page.rect.height
 
 base_name = uploaded.name.rsplit(".", 1)[0]
 
 st.subheader("Settings")
+st.caption("Export is vector-accurate (no rasterization) for reliability on Streamlit Cloud. DPI/image-format settings only affect preview.")
 c1, c2 = st.columns([1, 1], gap="large")
 with c1:
     st.markdown('<span class="settings-subtle">Output page size adapts to each cut.</span>', unsafe_allow_html=True)
@@ -309,76 +336,27 @@ if click and "y" in click:
 if export_clicked:
     cuts = sorted([y for y in st.session_state.cuts_y if 0 < y < 1])
 
-    # Build slices based on cuts: [0..cut1], [cut1..cut2], ... [last..H]
+    # Build ranges based on cuts: [0..cut1], [cut1..cut2], ... [last..1]
     ranges = []
-    start = 0
+    start = 0.0
     for y in cuts:
         ranges.append((start, y))
         start = y
     ranges.append((start, 1.0))
 
-    # Render once at the starting dpi; for Gradescope retries, downscale this image instead of re-rendering.
-    base_dpi = dpi
-    _ = render_page_image(pdf_bytes, dpi=base_dpi, max_pixels=None)  # warm cache for export
+    try:
+        out_bytes = export_vector_split(pdf_bytes, ranges)
+    except Exception as e:
+        st.exception(e)
+        st.stop()
 
-    def export_with_dpi(dpi_value: int, jpg_q: int) -> bytes:
-        export_w_px = int(page_w_pt * dpi_value / 72.0)
-        export_h_px = int(page_h_pt * dpi_value / 72.0)
-
-        max_export_pixels = 250_000_000
-        total_export_px = export_w_px * export_h_px
-        if total_export_px > max_export_pixels:
-            s = (max_export_pixels / total_export_px) ** 0.5
-            dpi_value = max(72, int(dpi_value * s))
-            export_w_px = int(page_w_pt * dpi_value / 72.0)
-            export_h_px = int(page_h_pt * dpi_value / 72.0)
-
-        # Render the PDF once at base_dpi (cached). If we need a smaller dpi, downscale.
-        export_img = render_page_image(pdf_bytes, dpi=base_dpi, max_pixels=None)
-        if dpi_value != base_dpi:
-            factor = dpi_value / float(base_dpi)
-            new_w = max(1, int(export_img.width * factor))
-            new_h = max(1, int(export_img.height * factor))
-            export_img = export_img.resize((new_w, new_h), Image.LANCZOS)
-
-        export_W, export_H = export_img.size
-
-        slices = []
-        for (y0, y1) in ranges:
-            if (y1 - y0) * export_H < 2:  # ignore ultra-tiny slices
-                continue
-            y0_px = int(y0 * export_H)
-            y1_px = int(y1 * export_H)
-            crop = export_img.crop((0, y0_px, export_W, y1_px))
-            slices.append(crop)
-
-        px_to_pt = 72.0 / dpi_value
-        return build_output_pdf_from_slices(slices, px_to_pt, img_format, jpg_q)
-
-    out_bytes = export_with_dpi(dpi, jpg_quality)
-
-    if quality_label.startswith("Gradescope"):
-        target_mb = 100.0
-        dpi_try = dpi
-        jpg_q_try = min(jpg_quality, 85)
-        last_dpi = None
-        last_q = None
-        while len(out_bytes) / 1_000_000 > target_mb:
-            if dpi_try == last_dpi and jpg_q_try == last_q:
-                break
-            last_dpi = dpi_try
-            last_q = jpg_q_try
-            dpi_try = max(10, int(dpi_try * 0.80))
-            jpg_q_try = max(30, jpg_q_try - 10)
-            out_bytes = export_with_dpi(dpi_try, jpg_q_try)
-
-    with export_slot:
-        st.download_button(
-            "Download PDF",
-            data=out_bytes,
-            file_name=f"{base_name}_split.pdf",
-            mime="application/pdf",
-        )
+with export_slot:
+    st.download_button(
+        "Download PDF",
+        data=out_bytes,
+        file_name=f"{base_name}_split.pdf",
+        mime="application/pdf",
+    )
 
 # Bottom tip
 st.markdown('<div style="height: 16px;"></div>', unsafe_allow_html=True)
